@@ -15,6 +15,7 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <lwip/sockets.h>
 #include <math.h>
 
 #include "img_converters.h"  // fmt2jpg() from the esp32-camera component bundled with the core
@@ -70,7 +71,12 @@ static bool sensorOk = false;
 static int sensorErrors = 0;
 static uint32_t lastSensorRetry = 0;
 static uint32_t lastMqttAttempt = 0;
-static uint32_t mqttRetryDelay = 2000;
+static uint32_t mqttRetryDelay = MQTT_RETRY_MIN_MS;
+static bool discoveryPublished = false;
+static bool discoveryPending = false;
+static uint32_t mqttDrops = 0;
+static uint32_t imagesSkipped = 0;
+static uint32_t lastSocketWritable = 0;
 static uint32_t lastStatePublish = 0;
 static uint32_t lastImagePublish = 0;
 static uint32_t lastFrameMs = 0;
@@ -78,6 +84,14 @@ static uint32_t frameCounter = 0;
 static float fpsEstimate = 0;
 static float lastMin = NAN;
 static float lastMax = NAN;
+
+// Forward declarations: the sensor helpers below publish through the MQTT
+// helpers, which are defined further down.
+static bool mqttPublishChecked(const String &topic, const uint8_t *payload, size_t len, bool retained,
+                               const char *what);
+static void mqttDrop(const char *why);
+static bool publishDiscovery();
+static void publishAvailability();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -132,7 +146,8 @@ static bool setupSensor() {
 }
 
 static void publishRateState() {
-  if (mqtt.connected()) mqtt.publish(topicRateState.c_str(), RATES[rateIndex].label, true);
+  const char *label = RATES[rateIndex].label;
+  mqttPublishChecked(topicRateState, (const uint8_t *)label, strlen(label), true, "refresh rate state");
 }
 
 static void applyRefreshRate(int idx, bool persist) {
@@ -195,13 +210,111 @@ static void setupWifi() {
 }
 
 static void maintainWifi() {
+  static uint32_t downSince = 0;
   static uint32_t lastKick = 0;
-  if (WiFi.status() == WL_CONNECTED) return;
-  if (millis() - lastKick > 10000) {
-    lastKick = millis();
-    Serial.println("[wifi] reconnecting...");
-    WiFi.reconnect();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (downSince) {
+      Serial.printf("[wifi] link back up, IP %s\n", WiFi.localIP().toString().c_str());
+      downSince = 0;
+    }
+    return;
   }
+
+  const uint32_t now = millis();
+  if (!downSince) {
+    downSince = now;
+    lastKick = now;
+    Serial.println("[wifi] link down, letting auto-reconnect work");
+    return;
+  }
+
+  // WiFi.reconnect() calls esp_wifi_disconnect() first, which aborts whatever
+  // association attempt setAutoReconnect() already has in flight. Kicking it
+  // every few seconds therefore keeps restarting the handshake instead of
+  // letting one finish. Step in only once the built-in retries have had time to
+  // fail, and then no more than once per grace period.
+  if (now - downSince < WIFI_RECONNECT_GRACE_MS) return;
+  if (now - lastKick < WIFI_RECONNECT_GRACE_MS) return;
+  lastKick = now;
+  Serial.println("[wifi] auto-reconnect has not recovered, forcing a reconnect");
+  WiFi.reconnect();
+}
+
+// ---------------------------------------------------------------------------
+// MQTT socket safety
+// ---------------------------------------------------------------------------
+// True when the TCP send buffer has room right now.
+//
+// WiFiClient::write() waits up to ten seconds (ten one-second select() retries)
+// for space before giving up and returning a short count, and it waits on the
+// calling task. Starting a publish on a socket that is already backed up
+// therefore stalls the sensor loop and then truncates the packet, so check
+// first and skip the frame instead.
+static bool mqttSocketWritable() {
+  const int sock = wifiClient.fd();
+  if (sock < 0) return false;
+  fd_set wfds;
+  FD_ZERO(&wfds);
+  FD_SET(sock, &wfds);
+  struct timeval tv = {0, 0};
+  return select(sock + 1, nullptr, &wfds, nullptr, &tv) > 0 && FD_ISSET(sock, &wfds);
+}
+
+// Closes the MQTT socket without writing anything to it.
+//
+// An MQTT packet declares its length up front. If only part of one reaches the
+// broker, the broker keeps consuming everything that follows as the missing
+// remainder: later PUBLISH headers and keepalive pings all disappear into that
+// unfinished payload, until some byte in the middle of a JPEG is finally read
+// as a control packet type and the broker resets the connection. Sending a
+// DISCONNECT would only add more bytes to the phantom payload, so drop the TCP
+// connection and start a fresh session instead.
+static void mqttDrop(const char *why) {
+  Serial.printf("[mqtt] dropping connection: %s\n", why);
+  wifiClient.stop();
+  (void)mqtt.connected();  // lets PubSubClient notice the loss and reset its state
+  mqttDrops++;
+  lastMqttAttempt = millis();
+  lastSocketWritable = 0;
+}
+
+// Whether an image can be published right now, and how long the socket has been
+// refusing data. A socket that never drains would otherwise sit there until the
+// keepalive finally expires, publishing nothing the whole time.
+static bool mqttReadyForImage() {
+  const uint32_t now = millis();
+  if (mqttSocketWritable()) {
+    lastSocketWritable = now;
+    return true;
+  }
+  if (!lastSocketWritable) {
+    lastSocketWritable = now;
+    return false;
+  }
+  if (now - lastSocketWritable >= (uint32_t)MQTT_SOCKET_STALL_MS) {
+    mqttDrop("send buffer full for too long");
+  }
+  return false;
+}
+
+// Publishes a small message, treating a failed write as a corrupted stream.
+//
+// PubSubClient::publish() sends the whole packet in a single WiFiClient::write()
+// and returns false when not all of it went out, which leaves the broker
+// mid-packet exactly as a short image write does.
+static bool mqttPublishChecked(const String &topic, const uint8_t *payload, size_t len, bool retained,
+                               const char *what) {
+  if (!mqtt.connected()) return false;
+  if (len + topic.length() + 8 > MQTT_BUFFER_BYTES) {
+    // Our own buffer limit, not a socket problem: the connection is still fine.
+    Serial.printf("[mqtt] %s does not fit the %u byte buffer (%u bytes)\n", what, (unsigned)MQTT_BUFFER_BYTES,
+                  (unsigned)len);
+    return false;
+  }
+  if (mqtt.publish(topic.c_str(), payload, len, retained)) return true;
+  mqttDrop(what);
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -226,12 +339,18 @@ static bool publishDiscoveryDoc(const String &component, const String &objectId,
   String topic = String(HA_DISCOVERY_PREFIX) + "/" + component + "/" + deviceId + "/" + objectId + "/config";
   String payload;
   serializeJson(doc, payload);
-  bool ok = mqtt.publish(topic.c_str(), payload.c_str(), true);
+  bool ok = mqttPublishChecked(topic, (const uint8_t *)payload.c_str(), payload.length(), true, "discovery config");
   if (!ok) Serial.printf("[mqtt] discovery publish failed for %s (%u bytes)\n", topic.c_str(), payload.length());
   return ok;
 }
 
-static void publishDiscovery() {
+static void publishAvailability() {
+  mqttPublishChecked(topicAvailability, (const uint8_t *)"online", 6, true, "availability");
+}
+
+// Stops at the first failure so a broken socket is not handed three more
+// payloads that cannot go out either.
+static bool publishDiscovery() {
   {
     JsonDocument doc;
     doc["name"] = "Thermal Image";
@@ -239,7 +358,7 @@ static void publishDiscovery() {
     doc["topic"] = topicImage;
     doc["icon"] = "mdi:thermometer-lines";
     addDeviceInfo(doc);
-    publishDiscoveryDoc("camera", "image", doc);
+    if (!publishDiscoveryDoc("camera", "image", doc)) return false;
   }
   {
     JsonDocument doc;
@@ -252,7 +371,7 @@ static void publishDiscovery() {
     doc["state_class"] = "measurement";
     doc["suggested_display_precision"] = 1;
     addDeviceInfo(doc);
-    publishDiscoveryDoc("sensor", "max", doc);
+    if (!publishDiscoveryDoc("sensor", "max", doc)) return false;
   }
   {
     JsonDocument doc;
@@ -265,7 +384,7 @@ static void publishDiscovery() {
     doc["state_class"] = "measurement";
     doc["suggested_display_precision"] = 1;
     addDeviceInfo(doc);
-    publishDiscoveryDoc("sensor", "min", doc);
+    if (!publishDiscoveryDoc("sensor", "min", doc)) return false;
   }
   {
     JsonDocument doc;
@@ -278,9 +397,10 @@ static void publishDiscovery() {
     doc["entity_category"] = "config";
     doc["icon"] = "mdi:speedometer";
     addDeviceInfo(doc);
-    publishDiscoveryDoc("select", "refresh_rate", doc);
+    if (!publishDiscoveryDoc("select", "refresh_rate", doc)) return false;
   }
   Serial.println("[mqtt] discovery published");
+  return true;
 }
 
 static void mqttCallback(char *topic, byte *payload, unsigned int length) {
@@ -292,10 +412,11 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length) {
     handleRateCommand(msg);
   } else if (topicHaStatus.equals(topic)) {
     // Home Assistant (re)started: announce ourselves again so entities are recreated.
+    // Publishing from inside the callback would reuse the PubSubClient buffer that
+    // still holds this incoming packet, so let the main loop do it.
     if (msg == "online") {
-      publishDiscovery();
-      mqtt.publish(topicAvailability.c_str(), "online", true);
-      publishRateState();
+      Serial.println("[mqtt] Home Assistant came online, re-announcing");
+      discoveryPending = true;
     }
   }
 }
@@ -307,22 +428,41 @@ static void mqttConnect() {
   bool ok = mqtt.connect(deviceId.c_str(), user, pass, topicAvailability.c_str(), 1, true, "offline");
   if (!ok) {
     Serial.printf("failed, rc=%d\n", mqtt.state());
-    mqttRetryDelay = min<uint32_t>(mqttRetryDelay * 2, 60000);
+    wifiClient.stop();  // make sure a half-open socket is not left behind
+    mqttRetryDelay = min<uint32_t>(mqttRetryDelay * 2, (uint32_t)MQTT_RETRY_MAX_MS);
     return;
   }
   Serial.println("connected");
-  mqttRetryDelay = 2000;
+  mqttRetryDelay = MQTT_RETRY_MIN_MS;
+  lastSocketWritable = millis();
   mqtt.subscribe(topicRateCommand.c_str());
   mqtt.subscribe(topicHaStatus.c_str());
-  publishDiscovery();
-  mqtt.publish(topicAvailability.c_str(), "online", true);
+  // The discovery configs are retained, so the broker keeps serving them to
+  // Home Assistant on its own. Re-sending them on every reconnect makes Home
+  // Assistant tear down and rebuild all four entities each time, which is a
+  // large part of why the dashboard felt slow.
+  if (!discoveryPublished) discoveryPending = true;
+  publishAvailability();
   publishRateState();
 }
 
 static void maintainMqtt() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    // The socket cannot survive the link going away; close it now so the next
+    // connect starts from a clean file descriptor.
+    if (mqtt.connected()) mqttDrop("wifi link lost");
+    return;
+  }
   if (mqtt.connected()) {
     mqtt.loop();
+    if (discoveryPending && mqtt.connected()) {
+      discoveryPending = false;
+      if (publishDiscovery()) {
+        discoveryPublished = true;
+        publishAvailability();
+        publishRateState();
+      }
+    }
     return;
   }
   if (millis() - lastMqttAttempt < mqttRetryDelay) return;
@@ -339,17 +479,33 @@ static void publishState() {
   doc["frames"] = frameCounter;
   char buf[192];
   size_t n = serializeJson(doc, buf, sizeof(buf));
-  mqtt.publish(topicState.c_str(), (const uint8_t *)buf, n, true);
+  mqttPublishChecked(topicState, (const uint8_t *)buf, n, true, "state");
 }
 
+// beginPublish() tells the broker how many payload bytes to expect, so once the
+// header is out the whole JPEG has to follow. Writing it in chunks means a
+// backed-up socket is detected at the first stalled chunk rather than after the
+// full ten second retry budget, and any shortfall costs one clean reconnect
+// instead of a silently desynchronised session.
 static void publishImage(const uint8_t *jpeg, size_t len) {
-  if (!mqtt.beginPublish(topicImage.c_str(), len, true)) {
-    Serial.println("[mqtt] beginPublish failed");
+  if (!mqtt.beginPublish(topicImage.c_str(), len, MQTT_IMAGE_RETAIN)) {
+    mqttDrop("image header write failed");
     return;
   }
-  size_t written = mqtt.write(jpeg, len);
+
+  size_t sent = 0;
+  while (sent < len) {
+    const size_t chunk = min<size_t>(len - sent, (size_t)MQTT_WRITE_CHUNK_BYTES);
+    const size_t n = mqtt.write(jpeg + sent, chunk);
+    sent += n;
+    if (n < chunk) break;  // send buffer is backed up; this packet is now truncated
+  }
   mqtt.endPublish();
-  if (written != len) Serial.printf("[mqtt] image publish short write %u/%u\n", (unsigned)written, (unsigned)len);
+
+  if (sent != len) {
+    Serial.printf("[mqtt] image truncated at %u/%u bytes\n", (unsigned)sent, (unsigned)len);
+    mqttDrop("truncated image publish");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,10 +578,16 @@ static void captureAndPublish() {
 
   if (mqtt.connected()) {
     if (MQTT_IMAGE_INTERVAL_MS == 0 || now - lastImagePublish >= (uint32_t)MQTT_IMAGE_INTERVAL_MS) {
-      lastImagePublish = now;
-      publishImage(jpeg, jpegLen);
+      if (mqttReadyForImage()) {
+        lastImagePublish = now;
+        publishImage(jpeg, jpegLen);
+      } else {
+        // Dropping one image is far cheaper than blocking the sensor loop for
+        // seconds and then truncating the packet.
+        imagesSkipped++;
+      }
     }
-    if (now - lastStatePublish >= (uint32_t)STATE_PUBLISH_INTERVAL_MS) {
+    if (mqtt.connected() && now - lastStatePublish >= (uint32_t)STATE_PUBLISH_INTERVAL_MS) {
       lastStatePublish = now;
       publishState();
     }
@@ -436,9 +598,12 @@ static void captureAndPublish() {
   static uint32_t lastLog = 0;
   if (now - lastLog > 5000) {
     lastLog = now;
-    Serial.printf("[frame] #%lu min %.1f C max %.1f C  %.1f fps  jpeg %u B  heap %u  stream clients %d\n",
-                  (unsigned long)frameCounter, lo, hi, fpsEstimate, (unsigned)jpegLen, (unsigned)ESP.getFreeHeap(),
-                  streamServerClientCount());
+    Serial.printf(
+        "[frame] #%lu min %.1f C max %.1f C  %.1f fps  jpeg %u B  heap %u  stream clients %d  mqtt %s  drops %lu  "
+        "images skipped %lu\n",
+        (unsigned long)frameCounter, lo, hi, fpsEstimate, (unsigned)jpegLen, (unsigned)ESP.getFreeHeap(),
+        streamServerClientCount(), mqtt.connected() ? "up" : "down", (unsigned long)mqttDrops,
+        (unsigned long)imagesSkipped);
   }
 }
 
@@ -473,9 +638,9 @@ void setup() {
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(2048);  // discovery payloads; images use the streaming publish API
-  mqtt.setKeepAlive(30);
-  mqtt.setSocketTimeout(5);
+  mqtt.setBufferSize(MQTT_BUFFER_BYTES);  // discovery payloads; images use the streaming publish API
+  mqtt.setKeepAlive(MQTT_KEEPALIVE_S);
+  mqtt.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
 }
 
 void loop() {

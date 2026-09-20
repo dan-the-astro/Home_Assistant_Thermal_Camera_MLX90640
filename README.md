@@ -6,7 +6,7 @@ MQTT discovery with these entities:
 
 | Entity | Type | Description |
 | --- | --- | --- |
-| Thermal Image | `camera` | False-colour JPEG of the latest frame, published on every frame |
+| Thermal Image | `camera` | False-colour JPEG of the latest frame, published every 2 s (`MQTT_IMAGE_INTERVAL_MS`) |
 | Maximum Temperature | `sensor` (°C) | Hottest pixel in the frame |
 | Minimum Temperature | `sensor` (°C) | Coldest pixel in the frame |
 | Frame Rate | `select` (config) | MLX90640 refresh rate: 0.5, 1, 2, 4, 8, 16, 32 or 64 Hz, stored in flash |
@@ -141,10 +141,16 @@ flash, so it survives reboots. Two things to know:
   32/64 Hz set `I2C_CLOCK_HZ` to `800000` or `1000000`. Higher refresh rates also increase sensor
   noise; 4 to 8 Hz gives the cleanest image for stationary scenes.
 
-Every image is published over MQTT by default. If you run the sensor at high rates and use the
-MJPEG stream for viewing, set `MQTT_IMAGE_INTERVAL_MS` (for example `2000`) to limit broker
-traffic while keeping the camera entity fresh. The temperature sensors are updated at most once per
-`STATE_PUBLISH_INTERVAL_MS` (1 s) so the recorder database stays small.
+Images go to MQTT every `MQTT_IMAGE_INTERVAL_MS` (2 s by default), not on every frame. The sensor
+still runs at the rate you select, and the MJPEG stream still shows every frame; only the MQTT
+camera entity is paced. This matters more than it looks: an image is around 8 kB while the ESP32's
+TCP send buffer is 5760 bytes, so publishing four of them per second keeps the socket permanently
+saturated. The Home Assistant frontend only refreshes a still-image camera every ten seconds or so,
+so the extra traffic buys nothing. Set the interval to `0` to publish every frame only if you know
+the link can take it.
+
+The temperature sensors are updated at most once per `STATE_PUBLISH_INTERVAL_MS` (1 s) so the
+recorder database stays small.
 
 ## MQTT topics
 
@@ -175,6 +181,19 @@ The firmware listens on `homeassistant/status` and re-announces itself when Home
 
 The palette is an "ironbow" gradient (black → purple → red → orange → yellow → white).
 
+## MQTT and connection options (`include/config.h`)
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `MQTT_IMAGE_INTERVAL_MS` | 2000 | Minimum gap between camera images. `0` publishes every frame |
+| `MQTT_IMAGE_RETAIN` | 1 | Retain the last image so HA has a picture right after a restart |
+| `MQTT_BUFFER_BYTES` | 2048 | PubSubClient packet buffer. Only discovery payloads use it |
+| `MQTT_WRITE_CHUNK_BYTES` | 1024 | Chunk size for streaming an image to the socket |
+| `MQTT_KEEPALIVE_S` / `MQTT_SOCKET_TIMEOUT_S` | 30 / 5 | Keepalive and CONNACK timeout |
+| `MQTT_RETRY_MIN_MS` / `MQTT_RETRY_MAX_MS` | 2000 / 60000 | Reconnect backoff, doubling after each failure |
+| `MQTT_SOCKET_STALL_MS` | 10000 | Drop and rebuild the session if the send buffer stays full this long |
+| `WIFI_RECONNECT_GRACE_MS` | 20000 | How long to let the ESP32's own auto-reconnect work before forcing one |
+
 ## Troubleshooting
 
 - **`MLX90640 not found`**: check 3V3/GND/SDA/SCL, the pull-ups and the address. The firmware
@@ -186,6 +205,17 @@ The palette is an "ironbow" gradient (black → purple → red → orange → ye
 - **Wrong colours** (cold = yellow, hot = blue): set `IMAGE_SWAP_RB 1`.
 - **Entities unavailable**: the broker holds the last will; the device is marked unavailable when
   its MQTT connection drops. Check WiFi signal and the serial monitor.
+- **The camera drops off every few seconds** and the serial monitor shows `image truncated`,
+  `dropping connection` or `Connection reset by peer`: the device is producing images faster than
+  the link to the broker can absorb them. An MQTT packet declares its length up front, so a
+  half-sent image leaves the broker consuming everything that follows as the rest of that payload
+  until it gives up and closes the socket. Raise `MQTT_IMAGE_INTERVAL_MS`, lower `JPEG_QUALITY` or
+  `IMAGE_SCALE`, and check the WiFi signal. The firmware recovers by rebuilding the session rather
+  than continuing on a corrupted one, and counts how often it has had to.
+- **Home Assistant feels slow or the entities keep reloading**: watch the `drops` and
+  `images skipped` counters in the `[frame]` log line. Anything other than a slowly growing
+  `images skipped` means the MQTT link is unhealthy. Discovery configs are retained and published
+  once per boot, so a device that re-announces repeatedly is reconnecting repeatedly.
 - **Several cameras**: set a distinct `DEVICE_ID` and `DEVICE_NAME` per board.
 
 ## Project layout

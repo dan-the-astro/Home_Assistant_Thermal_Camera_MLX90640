@@ -16,6 +16,10 @@ namespace {
 
 constexpr int kMaxStreamClients = 4;
 constexpr uint32_t kRequestTimeoutMs = 1500;
+// A single WiFiClient::write() already blocks for up to ten seconds on a client
+// that is not draining its socket. Without an overall deadline a stalled viewer
+// can hold the server task for minutes and freeze the other viewers with it.
+constexpr uint32_t kWriteTimeoutMs = 4000;
 constexpr const char *kBoundary = "thermalframe";
 
 WiFiServer *server = nullptr;
@@ -100,10 +104,14 @@ StreamStats copyStats() {
 
 bool writeAll(WiFiClient &c, const uint8_t *data, size_t len) {
   size_t sent = 0;
+  const uint32_t deadline = millis() + kWriteTimeoutMs;
   while (sent < len && c.connected()) {
     size_t n = c.write(data + sent, len - sent);
     if (n == 0) return false;
     sent += n;
+    // A short write leaves this multipart part truncated, so the caller has to
+    // drop the client rather than start the next boundary on a desynced stream.
+    if (sent < len && (int32_t)(millis() - deadline) >= 0) return false;
   }
   return sent == len;
 }
