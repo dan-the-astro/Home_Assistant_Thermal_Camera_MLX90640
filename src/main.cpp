@@ -21,6 +21,7 @@
 #include "img_converters.h"  // fmt2jpg() from the esp32-camera component bundled with the core
 
 #include "config.h"
+#include "frame_filter.h"
 #include "secrets.h"
 #include "stream_server.h"
 #include "thermal_image.h"
@@ -142,6 +143,7 @@ static bool setupSensor() {
   Wire.setClock(I2C_CLOCK_HZ);
   Serial.printf("[mlx] refresh rate %s, I2C %lu Hz\n", RATES[rateIndex].label, (unsigned long)I2C_CLOCK_HZ);
   sensorErrors = 0;
+  frameFilterReset();  // the offset pattern belongs to the old configuration
   return true;
 }
 
@@ -158,6 +160,7 @@ static void applyRefreshRate(int idx, bool persist) {
   }
   if (persist) prefs.putUChar("rate", (uint8_t)idx);
   fpsEstimate = 0;
+  frameFilterReset();  // integration time changed, so the offsets have too
   Serial.printf("[mlx] refresh rate set to %s\n", RATES[idx].label);
   publishRateState();
 }
@@ -525,6 +528,12 @@ static void captureAndPublish() {
   }
   sensorErrors = 0;
 
+  // Before anything reads these temperatures: the raw frame carries the
+  // sensor's own period-2 offset pattern and the occasional pixel that is
+  // tens of degrees out, and both would otherwise reach the palette and the
+  // min/max sensors.
+  frameFilterApply(frame);
+
   float lo, hi;
   if (!ThermalImage::stats(frame, lo, hi)) {
     Serial.println("[mlx] frame contained no valid pixels");
@@ -544,13 +553,28 @@ static void captureAndPublish() {
   // Colour mapping range
   float rlo, rhi;
 #if AUTO_RANGE
-  rlo = lo;
-  rhi = hi;
+  if (!ThermalImage::range(frame, RANGE_LOW_PERCENTILE, RANGE_HIGH_PERCENTILE, rlo, rhi)) {
+    rlo = lo;
+    rhi = hi;
+  }
   if (rhi - rlo < MIN_RANGE_SPAN_C) {
     const float mid = (rlo + rhi) * 0.5f;
     rlo = mid - MIN_RANGE_SPAN_C * 0.5f;
     rhi = mid + MIN_RANGE_SPAN_C * 0.5f;
   }
+  // Ease towards the new range instead of snapping to it, so someone
+  // walking through the scene does not recolour the whole background from
+  // one frame to the next.
+  static float smoothLo = NAN, smoothHi = NAN;
+  if (isnan(smoothLo) || isnan(smoothHi)) {
+    smoothLo = rlo;
+    smoothHi = rhi;
+  } else {
+    smoothLo += (rlo - smoothLo) * RANGE_ADAPT_RATE;
+    smoothHi += (rhi - smoothHi) * RANGE_ADAPT_RATE;
+  }
+  rlo = smoothLo;
+  rhi = smoothHi;
 #else
   rlo = FIXED_RANGE_MIN_C;
   rhi = FIXED_RANGE_MAX_C;
@@ -604,6 +628,15 @@ static void captureAndPublish() {
         (unsigned long)frameCounter, lo, hi, fpsEstimate, (unsigned)jpegLen, (unsigned)ESP.getFreeHeap(),
         streamServerClientCount(), mqtt.connected() ? "up" : "down", (unsigned long)mqttDrops,
         (unsigned long)imagesSkipped);
+
+    // What the pattern filter is taking out. These should settle within a few
+    // frames and then barely move; all zeroes means it never ran, and numbers
+    // that keep swinging mean it is chasing the scene rather than the sensor.
+    FrameFilterStats fs;
+    frameFilterGetStats(fs);
+    Serial.printf("[fpn]   %s  rows %.3f C  cols [%+.3f %+.3f %+.3f %+.3f] C  subpage %+.3f C\n",
+                  fs.primed ? "locked" : "priming", fs.rowAmp, fs.colCycle[0], fs.colCycle[1], fs.colCycle[2],
+                  fs.colCycle[3], fs.chess);
   }
 }
 

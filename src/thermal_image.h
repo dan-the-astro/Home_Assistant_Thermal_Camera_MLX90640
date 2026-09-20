@@ -19,6 +19,12 @@ public:
   // Returns false if the frame contained no valid pixels.
   static bool stats(const float *frame, float &minC, float &maxC);
 
+  // Colour range for the palette: the given percentiles of the frame rather
+  // than its single coldest and hottest pixel, so one noisy pixel at either end
+  // cannot decide the colour of everything else.
+  // Returns false if the frame contained no valid pixels.
+  static bool range(const float *frame, float lowPercent, float highPercent, float &lo, float &hi);
+
   // Renders `frame` mapping lo..hi degrees C onto the palette. The result is a
   // tightly packed 24-bit buffer in the byte order expected by fmt2jpg().
   void render(const float *frame, float lo, float hi);

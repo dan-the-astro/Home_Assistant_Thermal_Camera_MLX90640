@@ -51,7 +51,7 @@
 #define I2C_SCL_PIN SCL
 // 400 kHz is safe with typical breakout wiring and supports refresh rates up to 16 Hz.
 // Use 800000 or 1000000 (short wires, good pull-ups) if you want 32 / 64 Hz to keep up.
-#define I2C_CLOCK_HZ 400000
+#define I2C_CLOCK_HZ 800000
 #define MLX_I2C_ADDR 0x33
 // Sensor refresh rate used until it is changed from Home Assistant (0.5, 1, 2, 4, 8, 16, 32, 64).
 // Note: the MLX90640 produces one full frame per two refresh periods, so 8 Hz = ~4 images/s.
@@ -59,14 +59,26 @@
 
 // ---- Image rendering ----------------------------------------------------------
 // The 32x24 sensor frame is bilinearly upscaled by this factor (8 -> 256x192 pixels).
-#define IMAGE_SCALE 8
+#define IMAGE_SCALE 4
 // JPEG quality 1..100 (higher = larger images).
 #define JPEG_QUALITY 85
 // Flip the image if it appears mirrored / upside down for your mounting orientation.
 #define FLIP_HORIZONTAL 0
 #define FLIP_VERTICAL 0
-// 1 = colour range follows the min/max of each frame, 0 = fixed FIXED_RANGE_MIN..MAX.
+// 1 = colour range follows each frame's own temperature spread, 0 = fixed
+// FIXED_RANGE_MIN..MAX.
 #define AUTO_RANGE 1
+// With AUTO_RANGE the palette ends come from these percentiles of the frame
+// rather than from its single coldest and hottest pixel, so one noisy pixel at
+// either end no longer sets the colour of everything else. Anything past them
+// saturates to the end of the palette, which is usually what you want for a
+// small hot object; the min/max sensors still report the true extremes.
+#define RANGE_LOW_PERCENTILE 1.0f
+#define RANGE_HIGH_PERCENTILE 99.0f
+// How fast the palette range follows the scene (0..1 per frame, 1 = instantly).
+// Undamped, anything that walks through the frame recolours the whole
+// background. 0.25 settles in roughly ten frames.
+#define RANGE_ADAPT_RATE 0.25f
 // With AUTO_RANGE, never squeeze the palette into less than this many degrees C
 // (prevents a uniform scene from turning into amplified noise).
 #define MIN_RANGE_SPAN_C 4.0f
@@ -77,6 +89,46 @@
 #define VALID_TEMP_MAX_C 300.0f
 // Set to 1 if hot areas show up blue instead of yellow/white (swaps red/blue for the JPEG encoder).
 #define IMAGE_SWAP_RB 0
+
+// ---- Fixed-pattern noise ------------------------------------------------------
+// The MLX90640 reads its array as two interleaved subpages through row- and
+// column-banked electronics, and what the factory calibration leaves behind is a
+// small offset that repeats every two pixels: banding between odd and even rows,
+// a checkerboard between the two subpages, and weaker banding between columns.
+// It is only a few tenths of a degree, but AUTO_RANGE spreads the palette over
+// whatever the frame spans, so on a flat indoor scene those tenths land many
+// palette entries apart and read as a grid over the picture.
+// 1 = measure that pattern every frame and subtract it.
+#define FPN_FILTER 1
+// How fast the measured offsets follow the sensor (0..1 per frame). The pattern
+// drifts with die temperature so it has to be tracked, but re-measuring it from
+// scratch every frame would chase noise. 0.25 settles in about ten frames.
+#define FPN_ADAPT_RATE 0.25f
+// Ceiling on any single offset, in degrees C. The residual is tenths of a
+// degree; a larger estimate means the scene fooled the estimator.
+#define FPN_MAX_OFFSET_C 3.0f
+// How far one row may stand out from the rest of the array before it is treated
+// as scene rather than banding, as a multiple of the typical row. The sensor
+// bands every row by a similar amount; a sharp edge only shows up on the rows
+// it crosses. Lower is more cautious about erasing real detail.
+#define FPN_PROFILE_OUTLIER 3.0f
+// 1 = smooth the row-amplitude profile along the array before applying it.
+// Measured both ways: turning it off tracks an odd row slightly better, but
+// roughly triples how much a real edge is softened, so it stays on.
+#define FPN_ROW_SMOOTHING 1
+// The column offsets repeat every this many columns, because the array's column
+// electronics are grouped that way. Measured on a real part the cycle is four
+// columns wide and by far the largest of the three patterns, so a model that
+// only alternates between neighbours cannot remove it. The solver in
+// frame_filter.cpp is written for a period of four.
+#define FPN_COLUMN_PERIOD 4
+// 1 = replace pixels sitting more than DEAD_PIXEL_DELTA_C from the median of
+// their neighbours. A few MLX90640 pixels read tens of degrees off; the factory
+// marks them in EEPROM but the Adafruit library never applies that correction.
+// Keep the threshold wide: at 32x24 a genuinely hot object can occupy a single
+// pixel and a tighter filter would erase it.
+#define REPAIR_DEAD_PIXELS 1
+#define DEAD_PIXEL_DELTA_C 20.0f
 
 // ---- WiFi -------------------------------------------------------------------
 // How long to let the ESP32 core's own auto-reconnect work before forcing a

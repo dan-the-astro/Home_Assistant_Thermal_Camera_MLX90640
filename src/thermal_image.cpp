@@ -1,6 +1,7 @@
 #include "thermal_image.h"
 
 #include <Arduino.h>
+#include <algorithm>
 #include <esp_heap_caps.h>
 #include <math.h>
 #include <string.h>
@@ -23,6 +24,10 @@ const int kStopCount = sizeof(kStops) / sizeof(kStops[0]);
 inline bool plausible(float t) {
   return !isnan(t) && !isinf(t) && t >= VALID_TEMP_MIN_C && t <= VALID_TEMP_MAX_C;
 }
+
+// Scratch for range(). Static so a 3 kB copy of the frame does not land on the
+// Arduino loop task's stack once per frame.
+float gSorted[MLX_W * MLX_H];
 
 }  // namespace
 
@@ -73,6 +78,27 @@ bool ThermalImage::stats(const float *frame, float &minC, float &maxC) {
   }
   if (any) { minC = lo; maxC = hi; }
   return any;
+}
+
+bool ThermalImage::range(const float *frame, float lowPercent, float highPercent, float &lo, float &hi) {
+  int n = 0;
+  for (int i = 0; i < MLX_W * MLX_H; i++) {
+    if (plausible(frame[i])) gSorted[n++] = frame[i];
+  }
+  if (n == 0) return false;
+
+  int loIdx = (int)lroundf(lowPercent * 0.01f * (n - 1));
+  int hiIdx = (int)lroundf(highPercent * 0.01f * (n - 1));
+  loIdx = constrain(loIdx, 0, n - 1);
+  hiIdx = constrain(hiIdx, loIdx, n - 1);
+
+  // After the first partition everything from loIdx on is already >= the low
+  // end, so the second one only has to look at that tail.
+  std::nth_element(gSorted, gSorted + loIdx, gSorted + n);
+  lo = gSorted[loIdx];
+  std::nth_element(gSorted + loIdx, gSorted + hiIdx, gSorted + n);
+  hi = gSorted[hiIdx];
+  return true;
 }
 
 void ThermalImage::render(const float *frame, float lo, float hi) {
